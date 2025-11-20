@@ -1,0 +1,8 @@
+requests
+tqdm
+rich
+pdfplumber
+pypdf
+ebooklib
+beautifulsoup4
+lxml
