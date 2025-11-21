@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import os, re, json, time, pathlib, argparse, sys, posixpath
-from urllib.parse import unquote
+import os, re, json, time, pathlib, argparse, sys
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any, Union
+from collections import Counter
 import requests
 from tqdm import tqdm
 from rich.console import Console
@@ -16,7 +16,7 @@ from pypdf import PdfReader
 
 # EPUB deps
 from ebooklib import epub
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 # ---------------- Config ----------------
 DEFAULT_MODEL = "gpt-oss:20b"
@@ -25,6 +25,7 @@ MAX_CHUNK_CHARS = 12000
 CHUNK_OVERLAP = 800
 OUT_DIR = "summaries"
 HEADING_NEARBY_SCAN_PAGES = 3
+EPUB_PAGE_SIZE_DEFAULT = 3000  # characters per synthetic EPUB page
 
 console = Console()
 
@@ -57,8 +58,8 @@ If no explicit index is visible, infer likely chapters if possible; otherwise re
 
 @dataclass
 class Chapter:
-    idx_start: int      # 0-based start index (PDF page index OR EPUB spine index)
-    idx_end: Optional[int]  # exclusive; None means until EOF
+    idx_start: int      # 0-based start index (PDF page idx, EPUB spine idx, or synthetic page idx)
+    idx_end: Optional[int]  # exclusive for PDF/EPUB-spine; for synthetic pages we treat as inclusive page number
     title: str
     text: str = ""
 
@@ -116,6 +117,7 @@ Text to summarize (verbatim):
 \"\"\"{chunk_text_}\"\"\"
 
 Write a thorough, linear paragraph-style summary of ONLY this chunk. No quotes, no bullets, no questions.
+Write only what happens exactly in the story and leave out the unnecessary detail and concentrate on the storyline.
 """
     return ollama_generate(prompt, model=model)
 
@@ -205,151 +207,46 @@ def epub_spine_texts(book) -> List[str]:
     spine_texts: List[str] = []
     for (idref, _) in book.spine:
         item = book.get_item_with_id(idref)
+        # Some versions of ebooklib don't expose ITEM_DOCUMENT; check MIME type instead
         if item is None or not item.media_type.startswith("application/xhtml"):
             spine_texts.append("")
             continue
 
         soup = BeautifulSoup(item.get_body_content(), "lxml")
 
+        # Keep readable spacing
         for br in soup.find_all(["br"]):
             br.replace_with("\n")
         text = soup.get_text("\n")
 
+        # Normalize whitespace
         text = re.sub(r"\n{3,}", "\n\n", text)
         spine_texts.append(text.strip())
     return spine_texts
 
-# --- EPUB: helpers for path / href resolution and internal Contents parsing ---
-def _epub_spine_path_map(book):
+def epub_try_outline(book) -> List[Tuple[int, Optional[int], str]]:
     """
-    Build a list of (clean_path, spine_idx, item) for all spine items.
-    clean_path is the EPUB-internal path (no leading slash).
+    Build a top-level outline from the EPUB TOC (nav) that follows links:
+    - resolves fragments (#anchors)
+    - resolves relative paths
+    - maps TOC entries to spine items even if the href isn't a direct spine file
     """
-    spine_entries = []
+
+    # --- Build maps ---
+    spine_map = []           # [(clean_path, index)]
+    path_to_spine = {}        # clean_path → index
+
     for i, (idref, _) in enumerate(book.spine):
         item = book.get_item_with_id(idref)
         if not item:
             continue
-        name = item.get_name()  # e.g. "OEBPS/Text/chapter1.xhtml"
-        clean = name.lstrip("/")
-        spine_entries.append((clean, i, item))
-    return spine_entries
-
-
-def _resolve_href_to_spine_idx(book, from_item, spine_entries, href: str) -> Optional[int]:
-    """
-    Resolve an internal href (possibly relative, with a fragment) to a spine index.
-    This lets us 'follow' chapter links even when no explicit section numbers are provided.
-    """
-    if not href:
-        return None
-
-    path, _, _frag = href.partition("#")
-    path = path.strip()
-
-    # Empty path + fragment → same file
-    if not path:
-        base_clean = from_item.get_name().lstrip("/")
-        for clean, idx, _ in spine_entries:
-            if clean == base_clean:
-                return idx
-        return None
-
-    # Compute absolute path relative to the current item
-    base_name = from_item.get_name().lstrip("/")
-    base_dir = posixpath.dirname(base_name)
-    joined = posixpath.normpath(posixpath.join(base_dir, path))
-    joined = unquote(joined.lstrip("/"))
-
-    # Exact or loose match
-    for clean, idx, _ in spine_entries:
-        if clean == joined:
-            return idx
-        # Allow suffix match for path prefix differences
-        if clean.endswith("/" + joined.split("/")[-1]):
-            return idx
-    return None
-
-
-def epub_try_outline_from_internal_toc(book) -> List[Tuple[int, Optional[int], str]]:
-    """
-    Try to infer chapter starts from an internal 'Contents' page:
-    - Find a spine item whose heading text is 'Contents' or 'Table of Contents'
-    - Collect all <a href="...">TITLE</a> links after that heading
-    - Resolve each href to a spine index
-    - Build (start_idx, end_idx, title) tuples
-    """
-
-    spine_entries = _epub_spine_path_map(book)
-
-    for clean_path, spine_idx, item in spine_entries:
-        if not getattr(item, "media_type", "").startswith("application/xhtml"):
-            continue
-
-        soup = BeautifulSoup(item.get_body_content(), "lxml")
-
-        heading = None
-        for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
-            txt = (tag.get_text() or "").strip().lower()
-            if txt in ("contents", "table of contents", "toc"):
-                heading = tag
-                break
-        if not heading:
-            continue
-
-        links: List[Tuple[str, str]] = []
-        for a in heading.find_all_next("a", href=True):
-            title = (a.get_text() or "").strip()
-            if not title:
-                continue
-            links.append((a["href"], title))
-
-        if not links:
-            continue
-
-        starts: List[int] = []
-        titles_by_idx: Dict[int, str] = {}
-        seen: set[int] = set()
-
-        for href, title in links:
-            idx = _resolve_href_to_spine_idx(book, item, spine_entries, href)
-            if idx is None or idx in seen:
-                continue
-            seen.add(idx)
-            starts.append(idx)
-            titles_by_idx[idx] = title
-
-        if not starts:
-            continue
-
-        starts = sorted(starts)
-        out: List[Tuple[int, Optional[int], str]] = []
-        for i, s in enumerate(starts):
-            e = starts[i+1] if i+1 < len(starts) else None
-            title = re.sub(r"\s+", " ", titles_by_idx.get(s, "")).strip() or f"Chapter starting at section {s+1}"
-            out.append((s, e, title))
-
-        return out
-
-    return []
-
-def epub_try_outline(book) -> List[Tuple[int, Optional[int], str]]:
-    """
-    Build a top-level outline from the EPUB toc (nav) mapped to spine indices.
-    This version is more robust: it follows hrefs, resolves relative paths and fragments.
-    Returns list of (start_spine_idx, end_spine_idx_or_None, title).
-    """
-    # Build href -> spine index map
-    href_to_spine: Dict[str, int] = {}
-    spine_hrefs: List[str] = []
-    for i, (idref, _) in enumerate(book.spine):
-        it = book.get_item_with_id(idref)
-        href = it.get_name() if it else ""
-        href_clean = href.lstrip("/")
-        spine_hrefs.append(href_clean)
-        href_to_spine[href_clean] = i
+        name = item.get_name()  # e.g. "Text/ch1.xhtml"
+        clean = name.strip().lstrip("/")
+        spine_map.append((clean, i))
+        path_to_spine[clean] = i
 
     def normalize_href(href: str) -> Tuple[str, str]:
+        """Return (path_without_fragment, fragment)"""
         if not href:
             return "", ""
         parts = href.split("#", 1)
@@ -357,7 +254,8 @@ def epub_try_outline(book) -> List[Tuple[int, Optional[int], str]]:
         frag = parts[1] if len(parts) > 1 else ""
         return base, frag
 
-    def flatten_toc(toc, level=0):
+    # --- Flatten TOC entries ---
+    def flatten(toc, level=0):
         for entry in toc:
             if isinstance(entry, epub.Link):
                 yield {"title": entry.title, "href": entry.href, "level": level}
@@ -365,58 +263,207 @@ def epub_try_outline(book) -> List[Tuple[int, Optional[int], str]]:
                 item, children = entry[0], entry[1]
                 if isinstance(item, epub.Link):
                     yield {"title": item.title, "href": item.href, "level": level}
-                for sub in flatten_toc(children, level+1):
+                for sub in flatten(children, level+1):
                     yield sub
 
-    flat = list(flatten_toc(book.toc, level=0))
+    flat = list(flatten(book.toc, 0))
+
     matched = []
 
-    for f in flat:
-        href = f.get("href", "")
-        title = (f.get("title") or "").strip()
+    for ent in flat:
+        href = ent.get("href", "")
+        title = ent.get("title", "").strip()
         base, frag = normalize_href(href)
 
-        # Direct map
-        if base in href_to_spine:
-            matched.append({"title": title, "spine": href_to_spine[base], "level": f["level"]})
+        # --- Direct spine match ---
+        if base in path_to_spine:
+            matched.append({"title": title, "spine": path_to_spine[base], "level": ent["level"]})
             continue
 
-        # Loose matching: suffix match
-        for sh in spine_hrefs:
-            if sh.endswith(base):
-                matched.append({"title": title, "spine": href_to_spine[sh], "level": f["level"]})
+        # --- Try relative/loose matching (very common) ---
+        # e.g. nav.xhtml linking to "ch1.xhtml" while spine uses "Text/ch1.xhtml"
+        for clean, idx in spine_map:
+            if clean.endswith(base):
+                matched.append({"title": title, "spine": idx, "level": ent["level"]})
                 break
         else:
-            # As a last resort, if we have a fragment, try to find an item whose body contains that id
+            # --- LAST RESORT: scan spine text to find anchor ---
             if frag:
                 anchor_pattern = re.compile(rf'id\s*=\s*"{re.escape(frag)}"', re.IGNORECASE)
-                for i, (idref, _) in enumerate(book.spine):
-                    it = book.get_item_with_id(idref)
-                    if not it:
+                for clean, idx in spine_map:
+                    item = book.get_item_with_id(book.spine[idx][0])
+                    if not item:
                         continue
-                    try:
-                        html = it.get_content().decode(errors="ignore")
-                    except Exception:
-                        continue
+                    html = item.get_content().decode(errors="ignore")
                     if anchor_pattern.search(html):
-                        matched.append({"title": title, "spine": i, "level": f["level"]})
+                        matched.append({"title": title, "spine": idx, "level": ent["level"]})
                         break
 
-    # Only top-level entries
+    # Take top-level entries only
     top = [x for x in matched if x["level"] == 0]
     top_sorted = sorted(top, key=lambda d: d["spine"])
+
+    # Build contiguous chapter ranges
     out = []
     for i, it in enumerate(top_sorted):
         start = it["spine"]
         end = top_sorted[i+1]["spine"] if i+1 < len(top_sorted) else None
         title = re.sub(r"\s+", " ", it["title"]).strip()
         out.append((start, end, title))
+
     return out
 
 def epub_slice_sections(sections: List[str], start: int, end: Optional[int]) -> str:
     if end is None:
         end = len(sections)
     return "\n\n".join(sections[start:end])
+
+# ---------------- EPUB heading-based synthetic pages ----------------
+def clean_epub_text(s: str) -> str:
+    """Collapse whitespace for plain-text strings."""
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+def extract_section_text_from_heading(heading: Tag, heading_names) -> str:
+    """
+    Given a heading tag (h1/h2/h3), collect all text from it
+    until the next heading tag of any of those names.
+    """
+    parts = []
+
+    # Include heading text as part of the section
+    heading_text = heading.get_text(separator=" ", strip=True)
+    if heading_text:
+        parts.append(heading_text)
+
+    # Then all following siblings until next heading
+    for elem in heading.next_siblings:
+        if isinstance(elem, Tag) and elem.name in heading_names:
+            break  # next chapter begins
+        if isinstance(elem, Tag):
+            t = elem.get_text(separator=" ", strip=True)
+        else:
+            t = str(elem).strip()
+        if t:
+            parts.append(t)
+
+    return clean_epub_text(" ".join(parts))
+
+def extract_chapters_from_epub_item(item, chapter_index_offset: int, used_titles: Counter):
+    """
+    From a single XHTML item, extract a list of (chapter_title, text)
+    using H1/H2/H3 as chapter boundaries.
+
+    chapter_index_offset is used for fallback "Chapter N" numbering.
+
+    Returns:
+        chapters: list[(title, text)]
+        new_offset: updated offset for next fallback index
+    """
+    html = item.get_content()
+    soup = BeautifulSoup(html, "html.parser")
+
+    heading_names = ["h1", "h2", "h3"]
+    headings = [h for h in soup.find_all(heading_names) if h.get_text(strip=True)]
+
+    chapters = []
+    local_index = 0
+
+    for h in headings:
+        # Proposed title: heading text
+        title = h.get_text(separator=" ", strip=True)
+        if not title:
+            title = f"Chapter {chapter_index_offset + local_index + 1}"
+
+        # Make titles unique
+        used_titles[title] += 1
+        count = used_titles[title]
+        if count > 1:
+            unique_title = f"{title} ({count})"
+        else:
+            unique_title = title
+
+        text = extract_section_text_from_heading(h, heading_names)
+        if text:
+            chapters.append((unique_title, text))
+            local_index += 1
+
+    # If no headings at all, treat whole file as one chapter
+    if not chapters:
+        full_text = soup.get_text(separator=" ", strip=True)
+        full_text = clean_epub_text(full_text)
+        if full_text:
+            fallback_title = f"Chapter {chapter_index_offset + 1}"
+            used_titles[fallback_title] += 1
+            count = used_titles[fallback_title]
+            if count > 1:
+                fallback_title = f"{fallback_title} ({count})"
+            chapters.append((fallback_title, full_text))
+            local_index += 1
+
+    return chapters, chapter_index_offset + local_index
+
+def epub_build_chapters_from_headings(epub_path: str, page_size: int) -> List[Chapter]:
+    """
+    Build chapters from EPUB by:
+    - Treating each h1/h2/h3 as a chapter boundary.
+    - Computing synthetic page ranges based on character offsets.
+
+    Returns a list of Chapter where:
+      - idx_start: 0-based synthetic start page index
+      - idx_end:   synthetic end page (inclusive)
+      - title, text: full chapter text
+    """
+    book = epub.read_epub(epub_path)
+    spine_ids = [item_id for (item_id, _) in book.spine]
+
+    used_titles = Counter()
+
+    # 1) Extract all chapters in strict reading order
+    all_chapters: List[Tuple[str, str]] = []  # (title, text)
+    chapter_index_offset = 0
+
+    for item_id in spine_ids:
+        item = book.get_item_with_id(item_id)
+        # Only process HTML/XHTML-like items
+        if item is None or not getattr(item, "media_type", "").startswith("application/xhtml"):
+            continue
+
+        chapters, chapter_index_offset = extract_chapters_from_epub_item(
+            item, chapter_index_offset, used_titles
+        )
+        all_chapters.extend(chapters)
+
+    if not all_chapters:
+        return []
+
+    # 2) Convert chapters to synthetic page ranges based on global char offset
+    results: List[Chapter] = []
+    offset = 0
+
+    for title, text in all_chapters:
+        length = len(text)
+        if length == 0:
+            continue
+
+        start_offset = offset
+        end_offset = offset + length - 1
+
+        start_page = start_offset // page_size + 1
+        end_page = end_offset // page_size + 1
+
+        # Store pages in idx_* so the rest of the pipeline can reuse them.
+        # idx_start is 0-based page index; idx_end is inclusive page number.
+        ch = Chapter(
+            idx_start=start_page - 1,
+            idx_end=end_page,
+            title=title,
+            text=text,
+        )
+        results.append(ch)
+        offset += length
+
+    return results
 
 # ---------------- LLM TOC inference ----------------
 def ask_llm_for_toc(pieces: List[str], model: str, mode: str) -> List[Dict[str, Any]]:
@@ -541,11 +588,13 @@ def build_chapters_pdf(path: str, lookahead_pages: int, model: str,
         e = starts[i+1] if i+1 < len(starts) else None
         title = titles_by_idx.get(s)
         if not title:
+            # fallback title from page text
             lines = [l.strip() for l in (pages[s].splitlines() if pages[s] else []) if l.strip()]
             title = (lines[0][:120] if lines else f"Chapter starting at page {s+1}")
         text = pdf_slice_pages(pages, s, e)
         chapters.append(Chapter(idx_start=s, idx_end=e, title=title, text=text))
 
+    # Show alignment
     table = Table(title="Aligned Chapters (PDF)", show_lines=True)
     table.add_column("#", justify="right"); table.add_column("Title")
     table.add_column("Start PDF page (idx+1)"); table.add_column("End page idx")
@@ -556,26 +605,43 @@ def build_chapters_pdf(path: str, lookahead_pages: int, model: str,
 
 # ---------------- Build chapters (EPUB) ----------------
 def build_chapters_epub(path: str, lookahead_sections: int, model: str,
-                        manual_toc: Optional[List[Dict[str, Any]]]) -> List[Chapter]:
+                        manual_toc: Optional[List[Dict[str, Any]]],
+                        epub_page_size: int) -> List[Chapter]:
+    # Stage 0: try pure heading-based chapter detection + synthetic pages
+    console.rule("[bold]Stage 0 (EPUB): Heading-based synthetic pages[/bold]")
+    heading_chapters = epub_build_chapters_from_headings(path, epub_page_size)
+    if heading_chapters:
+        console.print(
+            f"[green]Built {len(heading_chapters)} chapters from HTML headings "
+            f"using page size {epub_page_size} chars.[/green]"
+        )
+        table = Table(title="Chapters from headings (EPUB)", show_lines=True)
+        table.add_column("#", justify="right")
+        table.add_column("Title")
+        table.add_column("Start synthetic page")
+        table.add_column("End synthetic page")
+
+        for i, ch in enumerate(heading_chapters, start=1):
+            table.add_row(str(i), ch.title, str(ch.idx_start + 1), str(ch.idx_end or ""))
+
+        console.print(table)
+        return heading_chapters
+
+    # Fallback: original TOC / LLM-based logic
     book = epub_load(path)
     sections = epub_spine_texts(book)
 
     console.rule("[bold]Stage 1 (EPUB): Try EPUB nav/TOC[/bold]")
     outline = epub_try_outline(book)
-
-    if not outline:
-        console.print("[yellow]No usable EPUB TOC. Trying internal 'Contents' page links.[/yellow]")
-        outline = epub_try_outline_from_internal_toc(book)
-
     if outline:
-        console.print(f"[green]Found EPUB outline with {len(outline)} entries.[/green]")
+        console.print(f"[green]Found EPUB TOC with {len(outline)} entries.[/green]")
         chapters = []
         for (start, end, title) in outline:
             text = epub_slice_sections(sections, start, end)
             chapters.append(Chapter(idx_start=start, idx_end=end, title=title, text=text))
         return chapters
 
-    console.print("[yellow]No TOC or internal contents links. Using LLM to infer chapters.[/yellow]")
+    console.print("[yellow]No usable EPUB TOC. Using LLM to infer chapters.[/yellow]")
     console.rule("[bold]Stage 2 (EPUB): LLM TOC inference from first sections[/bold]")
     toc_guess = ask_llm_for_toc(sections[:lookahead_sections], model=model, mode="epub")
 
@@ -583,6 +649,7 @@ def build_chapters_epub(path: str, lookahead_sections: int, model: str,
         toc_guess = manual_toc if manual_toc else request_manual_toc_from_stdin()
 
     console.rule("[bold]Stage 3 (EPUB): Align to spine sections[/bold]")
+    # For EPUB we align directly to the section index (no page headings)
     starts: List[int] = []
     titles_by_idx: Dict[int, str] = {}
     for item in toc_guess:
@@ -601,11 +668,13 @@ def build_chapters_epub(path: str, lookahead_sections: int, model: str,
         e = starts[i+1] if i+1 < len(starts) else None
         title = titles_by_idx.get(s)
         if not title:
+            # fallback: first non-empty line in section
             lines = [l.strip() for l in (sections[s].splitlines() if sections[s] else []) if l.strip()]
             title = (lines[0][:120] if lines else f"Chapter starting at section {s+1}")
         text = epub_slice_sections(sections, s, e)
         chapters.append(Chapter(idx_start=s, idx_end=e, title=title, text=text))
 
+    # Show alignment
     table = Table(title="Aligned Chapters (EPUB)", show_lines=True)
     table.add_column("#", justify="right"); table.add_column("Title")
     table.add_column("Start section (idx+1)"); table.add_column("End section idx")
@@ -619,7 +688,8 @@ def write_markdown(path: pathlib.Path, content: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
-def main(book_path: str, out_dir: str, model: str, lookahead: int, force: bool, manual_toc_file: Optional[str]):
+def main(book_path: str, out_dir: str, model: str, lookahead: int,
+         force: bool, manual_toc_file: Optional[str], epub_page_size: int):
     console.rule(f"[bold]Start[/bold]  Book: {book_path}")
     console.print(f"Ollama host: [cyan]{OLLAMA_HOST}[/cyan]  |  Model: [magenta]{model}[/magenta]")
     console.print(f"Output dir: [green]{out_dir}[/green]  |  TOC scan window: {lookahead}")
@@ -634,8 +704,9 @@ def main(book_path: str, out_dir: str, model: str, lookahead: int, force: bool, 
         with console.status("[bold cyan]Building chapters (PDF)…[/bold cyan]"):
             chapters = build_chapters_pdf(book_path, lookahead, model, manual_toc)
     elif ext == ".epub":
+        console.print(f"EPUB synthetic page size: {epub_page_size} chars")
         with console.status("[bold cyan]Building chapters (EPUB)…[/bold cyan]"):
-            chapters = build_chapters_epub(book_path, lookahead, model, manual_toc)
+            chapters = build_chapters_epub(book_path, lookahead, model, manual_toc, epub_page_size)
     else:
         console.print(f"[red]Unsupported file extension: {ext}. Use PDF or EPUB.[/red]")
         sys.exit(1)
@@ -653,9 +724,11 @@ def main(book_path: str, out_dir: str, model: str, lookahead: int, force: bool, 
             index_rows.append((i, ch.title, str(out_md)))
             continue
 
+        # Log chapter info
         rng = f"{ch.idx_start+1} → {(ch.idx_end or 'EOF')}"
         console.print(Panel.fit(f"[bold]Chapter {i}[/bold]: {ch.title}\nSpan: {rng}", style="bold blue"))
 
+        # Chunk and summarize
         chunks = chunk_text(ch.text, MAX_CHUNK_CHARS, CHUNK_OVERLAP)
         console.print(f"Chunking → {len(chunks)} chunk(s) (≈{len(ch.text)} chars)")
 
@@ -685,6 +758,7 @@ def main(book_path: str, out_dir: str, model: str, lookahead: int, force: bool, 
         console.print(f"[green]Wrote[/green] {out_md.name}")
         index_rows.append((i, ch.title, str(out_md)))
 
+    # Write index
     index_md = summary_dir / "_index.md"
     lines = ["# Chapter Summaries Index\n"]
     for i, title, path in index_rows:
@@ -702,5 +776,11 @@ if __name__ == "__main__":
     ap.add_argument("--pages", type=int, default=20, help="How many initial units to show the LLM (PDF pages or EPUB sections)")
     ap.add_argument("--force", action="store_true", help="Overwrite existing summaries")
     ap.add_argument("--manual-toc", help="Path to a JSON file with TOC (PDF: title+start_page; EPUB: title+start_section)")
+    ap.add_argument(
+        "--epub-page-size",
+        type=int,
+        default=EPUB_PAGE_SIZE_DEFAULT,
+        help="Characters per synthetic EPUB page when using heading-based indexing",
+    )
     args = ap.parse_args()
-    main(args.book, args.out, args.model, args.pages, args.force, args.manual_toc)
+    main(args.book, args.out, args.model, args.pages, args.force, args.manual_toc, args.epub_page_size)
